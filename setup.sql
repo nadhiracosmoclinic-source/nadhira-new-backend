@@ -71,4 +71,4 @@ CREATE TABLE IF NOT EXISTS product_catalog (
     UNIQUE KEY unique_catalog_item (name, category),
     INDEX idx_catalog_name (name),
     INDEX idx_catalog_category (category)
-);
+); 
