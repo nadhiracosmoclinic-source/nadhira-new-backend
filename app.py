@@ -1,6 +1,7 @@
 import json
 import os
 import csv
+import re
 from datetime import date
 from functools import wraps
 from io import BytesIO, StringIO
@@ -30,6 +31,27 @@ if cors_origins:
 else:
     CORS(app, supports_credentials=True)
 database_ready = False
+
+
+def auto_category(name):
+    text = str(name or "").upper()
+    if re.search(r"\b(SHAMPOO|HAIR|SCALP|TUGAIN|MINTOP|MANDIL|MORR|MINOX|MINSCALP|CONDITIONER|DYE|GREY)\b", text):
+        return "Hair Care"
+    if re.search(r"\b(SOAP|BAR|FACE|CREAM|GEL|LOTION|SERUM|SUN|SPF|CLEANSER|MOIST|WASH|MASK|LIP|OINT|NAIL|SPRAY|POWDER|ROLL ON)\b", text):
+        return "Skin Care"
+    return "Medicine"
+
+
+def load_seed_catalog_names():
+    seed_file = os.path.join(FRONTEND_DIR, "seed-catalog.js")
+    try:
+        content = open(seed_file, "r", encoding="utf-8").read()
+    except OSError:
+        return []
+    match = re.search(r"`([\s\S]*?)`", content)
+    if not match:
+        return []
+    return [line.strip() for line in match.group(1).splitlines() if line.strip()]
 
 
 # Database Helpers: all MySQL reads/writes pass through these functions.
@@ -200,9 +222,22 @@ def seed_users():
             )
 
 
+def seed_catalog():
+    for name in load_seed_catalog_names():
+        execute(
+            """
+            INSERT INTO product_catalog (name, category, default_dose, default_notes, created_by)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE name=VALUES(name)
+            """,
+            (name, auto_category(name), "", "", "system"),
+        )
+
+
 def init_database():
     create_tables()
     seed_users()
+    seed_catalog()
 
 
 # Auth Helpers: session login and optional role checking for protected API routes.
@@ -552,10 +587,8 @@ def sessions():
 
 
 @app.route("/api/sessions/<int:session_id>", methods=["PUT", "DELETE"])
-@login_required()
+@login_required("receptionist")
 def session_detail(session_id):
-    if session["user"]["role"] not in ["receptionist", "doctor"]:
-        return jsonify({"error": "Access denied"}), 403
     existing = query_one("SELECT id FROM prescriptions WHERE id=%s", (session_id,))
     if not existing:
         return jsonify({"error": "Session not found"}), 404
@@ -584,7 +617,7 @@ def session_detail(session_id):
 
 
 @app.route("/api/sessions/<int:session_id>/restore", methods=["POST"])
-@login_required()
+@login_required("receptionist")
 def restore_session(session_id):
     existing = query_one("SELECT id FROM prescriptions WHERE id=%s", (session_id,))
     if not existing:
@@ -709,6 +742,40 @@ def upload_catalog():
         )
         saved += 1
     return jsonify({"message": "Catalog uploaded", "saved": saved})
+
+
+@app.route("/api/catalog/<int:item_id>", methods=["PUT", "DELETE"])
+@login_required()
+def catalog_detail(item_id):
+    existing = query_one("SELECT id FROM product_catalog WHERE id=%s", (item_id,))
+    if not existing:
+        return jsonify({"error": "Catalog item not found"}), 404
+    if request.method == "DELETE":
+        execute("DELETE FROM product_catalog WHERE id=%s", (item_id,))
+        return jsonify({"message": "Catalog item deleted"})
+
+    data = request.get_json(force=True)
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Name is required"}), 400
+    category = data.get("category", "Medicine")
+    if category not in ["Medicine", "Skin Care", "Hair Care"]:
+        category = "Medicine"
+    execute(
+        """
+        UPDATE product_catalog
+        SET name=%s, category=%s, default_dose=%s, default_notes=%s
+        WHERE id=%s
+        """,
+        (
+            name,
+            category,
+            data.get("default_dose", ""),
+            data.get("default_notes", ""),
+            item_id,
+        ),
+    )
+    return jsonify({"message": "Catalog item updated", "id": item_id})
 
 
 @app.route("/api/export/<kind>")
