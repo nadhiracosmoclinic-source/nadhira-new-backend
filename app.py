@@ -2,15 +2,19 @@ import json
 import os
 import csv
 import re
-from datetime import date
+from datetime import date, timedelta
 from functools import wraps
 from io import BytesIO, StringIO
 
 import mysql.connector
+from mysql.connector import errorcode
 from openpyxl import load_workbook
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory, session
 from flask_cors import CORS
+from mysql.connector import Error as MySQLError
+from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 load_dotenv()
@@ -22,9 +26,18 @@ cors_origins = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "").s
 
 app = Flask(__name__, static_folder=None)
 app.secret_key = os.getenv("SECRET_KEY", "change-this-secret-key")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+is_production = bool(os.getenv("RENDER") or os.getenv("FRONTEND_ORIGINS"))
+session_cookie_samesite = os.getenv("SESSION_COOKIE_SAMESITE") or ("None" if is_production else "Lax")
+session_cookie_secure = os.getenv("SESSION_COOKIE_SECURE")
+if session_cookie_secure is None:
+    session_cookie_secure = "true" if is_production else "false"
 app.config.update(
-    SESSION_COOKIE_SAMESITE=os.getenv("SESSION_COOKIE_SAMESITE", "Lax"),
-    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE=session_cookie_samesite,
+    SESSION_COOKIE_SECURE=session_cookie_secure.lower() == "true",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=int(os.getenv("SESSION_DAYS", "30"))),
 )
 if cors_origins:
     CORS(app, origins=cors_origins, supports_credentials=True)
@@ -67,7 +80,22 @@ def db_config():
 
 
 def get_db():
-    return mysql.connector.connect(**db_config())
+    config = db_config()
+    try:
+        return mysql.connector.connect(**config)
+    except MySQLError as error:
+        if error.errno != errorcode.ER_BAD_DB_ERROR:
+            raise
+        database = config.pop("database")
+        if not re.match(r"^[A-Za-z0-9_]+$", database):
+            raise
+        conn = mysql.connector.connect(**config)
+        cursor = conn.cursor()
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return mysql.connector.connect(**db_config())
 
 
 def query_all(sql, params=None):
@@ -223,15 +251,23 @@ def seed_users():
 
 
 def seed_catalog():
-    for name in load_seed_catalog_names():
-        execute(
-            """
-            INSERT INTO product_catalog (name, category, default_dose, default_notes, created_by)
-            VALUES (%s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE name=VALUES(name)
-            """,
-            (name, auto_category(name), "", "", "system"),
-        )
+    names = load_seed_catalog_names()
+    if not names:
+        return
+    rows = [(name, auto_category(name), "", "", "system") for name in names]
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.executemany(
+        """
+        INSERT INTO product_catalog (name, category, default_dose, default_notes, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE name=VALUES(name)
+        """,
+        rows,
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 
 def init_database():
@@ -247,6 +283,20 @@ def ensure_database_ready():
     if not database_ready and request.path.startswith("/api/"):
         init_database()
         database_ready = True
+
+
+@app.errorhandler(MySQLError)
+def handle_mysql_error(error):
+    app.logger.exception("MySQL error")
+    return jsonify({"error": "Database connection failed", "detail": str(error)}), 503
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return error
+    app.logger.exception("Unexpected error")
+    return jsonify({"error": "Server error", "detail": str(error)}), 500
 
 
 def login_required(role=None):
@@ -337,7 +387,8 @@ def frontend_file(filename):
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "database": os.getenv("MYSQL_DATABASE", "clinic")})
+    catalog_count = query_one("SELECT COUNT(*) AS count FROM product_catalog")["count"]
+    return jsonify({"status": "ok", "database": os.getenv("MYSQL_DATABASE", "clinic"), "catalog": catalog_count})
 
 
 # API Routes: authentication, patients, appointments, prescriptions, medicine library, exports, and backups.
@@ -349,6 +400,7 @@ def login():
     user = query_one("SELECT * FROM users WHERE username=%s", (username,))
     if not user or not check_password_hash(user["password_hash"], password):
         return jsonify({"error": "Invalid username or password"}), 401
+    session.permanent = True
     session["user"] = {
         "id": user["id"],
         "username": user["username"],
