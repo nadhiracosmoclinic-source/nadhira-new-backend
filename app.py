@@ -10,7 +10,7 @@ import mysql.connector
 from mysql.connector import errorcode
 from openpyxl import load_workbook
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_from_directory, session
+from flask import Flask, abort, jsonify, request, send_from_directory, session
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
 from werkzeug.exceptions import HTTPException
@@ -22,6 +22,7 @@ load_dotenv()
 # Backend Config: Flask API, MySQL connection, CORS, sessions, and static frontend hosting.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
+CATALOG_SEED_FILE = os.path.join(BASE_DIR, "catalog_seed.json")
 cors_origins = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "").split(",") if origin.strip()]
 
 app = Flask(__name__, static_folder=None)
@@ -56,15 +57,26 @@ def auto_category(name):
 
 
 def load_seed_catalog_names():
-    seed_file = os.path.join(FRONTEND_DIR, "seed-catalog.js")
     try:
-        content = open(seed_file, "r", encoding="utf-8").read()
-    except OSError:
+        with open(CATALOG_SEED_FILE, "r", encoding="utf-8") as seed_file:
+            names = json.load(seed_file)
+    except (OSError, json.JSONDecodeError) as error:
+        app.logger.warning("Catalog seed file could not be loaded: %s", error)
         return []
-    match = re.search(r"`([\s\S]*?)`", content)
-    if not match:
+
+    if not isinstance(names, list):
+        app.logger.warning("Catalog seed file must contain a JSON array")
         return []
-    return [line.strip() for line in match.group(1).splitlines() if line.strip()]
+
+    unique_names = []
+    seen = set()
+    for raw_name in names:
+        name = str(raw_name or "").strip()
+        key = name.casefold()
+        if name and key not in seen:
+            unique_names.append(name)
+            seen.add(key)
+    return unique_names
 
 
 # Database Helpers: all MySQL reads/writes pass through these functions.
@@ -251,9 +263,16 @@ def seed_users():
 
 
 def seed_catalog():
+    existing = query_one("SELECT COUNT(*) AS count FROM product_catalog")
+    if existing and int(existing["count"] or 0) > 0:
+        app.logger.info("Catalog seed skipped because product_catalog already has data")
+        return
+
     names = load_seed_catalog_names()
     if not names:
+        app.logger.warning("Catalog seed skipped because no backend seed items were found")
         return
+
     rows = [(name, auto_category(name), "", "", "system") for name in names]
     conn = get_db()
     cursor = conn.cursor()
@@ -377,11 +396,15 @@ def catalog_rows_from_upload(file_storage):
 # Frontend Routes: Flask can serve the ready frontend directly when deployed together.
 @app.route("/")
 def home():
+    if not os.path.exists(os.path.join(FRONTEND_DIR, "index.html")):
+        return jsonify({"status": "ok", "service": "clinic backend"})
     return send_from_directory(FRONTEND_DIR, "index.html")
 
 
 @app.route("/<path:filename>")
 def frontend_file(filename):
+    if not os.path.exists(os.path.join(FRONTEND_DIR, filename)):
+        abort(404)
     return send_from_directory(FRONTEND_DIR, filename)
 
 
@@ -451,6 +474,8 @@ def patients():
         if missing:
             return jsonify({"error": "Missing fields", "fields": missing}), 400
         patient_id = data.get("patient_id", "").strip() or next_patient_id()
+        if query_one("SELECT id FROM patients WHERE patient_id=%s", (patient_id,)):
+            patient_id = next_patient_id()
         new_id = execute(
             """
             INSERT INTO patients
