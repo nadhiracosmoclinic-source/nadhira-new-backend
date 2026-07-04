@@ -28,6 +28,18 @@ CREATE TABLE IF NOT EXISTS patients (
     INDEX idx_visit_date (date_of_visit)
 );
 
+CREATE TABLE IF NOT EXISTS patient_id_sequences (
+    sequence_date DATE PRIMARY KEY,
+    next_number INT NOT NULL DEFAULT 1,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS prescription_sequences (
+    sequence_date DATE PRIMARY KEY,
+    next_number INT NOT NULL DEFAULT 1,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS appointments (
     id INT AUTO_INCREMENT PRIMARY KEY,
     patient_db_id INT NOT NULL,
@@ -38,7 +50,9 @@ CREATE TABLE IF NOT EXISTS appointments (
     notes TEXT,
     created_by VARCHAR(80) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (patient_db_id) REFERENCES patients(id)
+    FOREIGN KEY (patient_db_id) REFERENCES patients(id) ON DELETE CASCADE,
+    INDEX idx_appointment_date (appointment_date),
+    INDEX idx_appointment_patient (patient_db_id)
 );
 
 CREATE TABLE IF NOT EXISTS prescriptions (
@@ -56,8 +70,9 @@ CREATE TABLE IF NOT EXISTS prescriptions (
     receptionist_instructions TEXT,
     created_by VARCHAR(80) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (patient_db_id) REFERENCES patients(id),
-    INDEX idx_prescription_date (prescription_date)
+    FOREIGN KEY (patient_db_id) REFERENCES patients(id) ON DELETE CASCADE,
+    INDEX idx_prescription_date (prescription_date),
+    INDEX idx_prescription_patient (patient_db_id)
 );
 
 CREATE TABLE IF NOT EXISTS product_catalog (
