@@ -2,6 +2,7 @@ import json
 import os
 import csv
 import re
+import time
 from datetime import date, timedelta
 from functools import wraps
 from io import BytesIO, StringIO
@@ -35,6 +36,7 @@ session_cookie_secure = os.getenv("SESSION_COOKIE_SECURE")
 if session_cookie_secure is None:
     session_cookie_secure = "true" if is_production else "false"
 app.config.update(
+    MAX_CONTENT_LENGTH=int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE=session_cookie_samesite,
     SESSION_COOKIE_SECURE=session_cookie_secure.lower() == "true",
@@ -45,6 +47,25 @@ if cors_origins:
 else:
     CORS(app, supports_credentials=True)
 database_ready = False
+login_attempts = {}
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "300"))
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "8"))
+
+if is_production and app.secret_key == "change-this-secret-key":
+    raise RuntimeError("SECRET_KEY must be set to a strong random value in production")
+
+
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.is_secure or is_production:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
+
+app.after_request(security_headers)
 
 
 def auto_category(name):
@@ -160,7 +181,6 @@ def create_tables():
             location_area VARCHAR(180) NOT NULL,
             main_concern TEXT NOT NULL,
             created_by VARCHAR(80) NOT NULL,
-            deleted_at TIMESTAMP NULL DEFAULT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             INDEX idx_patient_search (name, phone, patient_id),
@@ -179,7 +199,23 @@ def create_tables():
             notes TEXT,
             created_by VARCHAR(80) NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (patient_db_id) REFERENCES patients(id)
+            FOREIGN KEY (patient_db_id) REFERENCES patients(id) ON DELETE CASCADE,
+            INDEX idx_appointment_date (appointment_date),
+            INDEX idx_appointment_patient (patient_db_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS patient_id_sequences (
+            sequence_date DATE PRIMARY KEY,
+            next_number INT NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS prescription_sequences (
+            sequence_date DATE PRIMARY KEY,
+            next_number INT NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )
         """,
         """
@@ -211,10 +247,10 @@ def create_tables():
             treatment_notes TEXT,
             receptionist_instructions TEXT,
             created_by VARCHAR(80) NOT NULL,
-            deleted_at TIMESTAMP NULL DEFAULT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (patient_db_id) REFERENCES patients(id),
-            INDEX idx_prescription_date (prescription_date)
+            FOREIGN KEY (patient_db_id) REFERENCES patients(id) ON DELETE CASCADE,
+            INDEX idx_prescription_date (prescription_date),
+            INDEX idx_prescription_patient (patient_db_id)
         )
         """,
     ]
@@ -225,10 +261,10 @@ def create_tables():
     conn.commit()
     cursor.close()
     conn.close()
-    ensure_soft_delete_columns()
+    ensure_production_schema()
 
 
-def ensure_soft_delete_columns():
+def ensure_production_schema():
     conn = get_db()
     cursor = conn.cursor()
     database = os.getenv("MYSQL_DATABASE", "clinic")
@@ -241,8 +277,17 @@ def ensure_soft_delete_columns():
             (database, table),
         )
         exists = cursor.fetchone()[0]
-        if not exists:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN deleted_at TIMESTAMP NULL DEFAULT NULL")
+        if exists:
+            cursor.execute(f"ALTER TABLE {table} DROP COLUMN deleted_at")
+    for statement in [
+        "CREATE INDEX idx_patient_created ON patients (created_at)",
+        "CREATE INDEX idx_prescription_created ON prescriptions (created_at)",
+    ]:
+        try:
+            cursor.execute(statement)
+        except MySQLError as error:
+            if error.errno != errorcode.ER_DUP_KEYNAME:
+                raise
     conn.commit()
     cursor.close()
     conn.close()
@@ -333,6 +378,29 @@ def login_required(role=None):
     return decorator
 
 
+def client_key():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return (forwarded.split(",")[0].strip() or request.remote_addr or "unknown")[:80]
+
+
+def check_login_rate_limit(username):
+    now = time.time()
+    key = f"{client_key()}:{username.lower()}"
+    attempts = [stamp for stamp in login_attempts.get(key, []) if now - stamp < LOGIN_WINDOW_SECONDS]
+    if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+        return False, key, attempts
+    return True, key, attempts
+
+
+def remember_failed_login(key, attempts):
+    attempts.append(time.time())
+    login_attempts[key] = attempts
+
+
+def clear_failed_login(key):
+    login_attempts.pop(key, None)
+
+
 def normalize_json_list(value):
     if isinstance(value, list):
         return value
@@ -352,19 +420,29 @@ def parse_json_field(value):
     return value or []
 
 
-def next_patient_id():
-    prefix = f"PT-{date.today().strftime('%Y%m%d')}-"
-    row = query_one(
-        "SELECT patient_id FROM patients WHERE patient_id LIKE %s ORDER BY patient_id DESC LIMIT 1",
-        (f"{prefix}%",),
+def next_sequence_value(cursor, table_name):
+    if table_name not in {"patient_id_sequences", "prescription_sequences"}:
+        raise ValueError("Invalid sequence table")
+    today_value = date.today()
+    cursor.execute(
+        f"INSERT IGNORE INTO {table_name} (sequence_date, next_number) VALUES (%s, 1)",
+        (today_value,),
     )
-    if not row:
-        return f"{prefix}001"
-    try:
-        number = int(str(row["patient_id"]).replace(prefix, "")) + 1
-    except ValueError:
-        number = 1
-    return f"{prefix}{number:03d}"
+    cursor.execute(f"SELECT next_number FROM {table_name} WHERE sequence_date=%s FOR UPDATE", (today_value,))
+    row = cursor.fetchone()
+    number = int(row[0])
+    cursor.execute(f"UPDATE {table_name} SET next_number=%s WHERE sequence_date=%s", (number + 1, today_value))
+    return today_value, number
+
+
+def next_patient_id(cursor):
+    today_value, number = next_sequence_value(cursor, "patient_id_sequences")
+    return f"PT-{today_value.strftime('%Y%m%d')}-{number:06d}"
+
+
+def next_prescription_no(cursor):
+    today_value, number = next_sequence_value(cursor, "prescription_sequences")
+    return f"RX-{today_value.strftime('%Y%m%d')}-{number:06d}"
 
 
 def rows_to_csv(rows, headers):
@@ -420,9 +498,14 @@ def login():
     data = request.get_json(force=True)
     username = data.get("username", "").strip()
     password = data.get("password", "")
+    allowed, attempt_key, attempts = check_login_rate_limit(username)
+    if not allowed:
+        return jsonify({"error": "Too many login attempts. Try again later."}), 429
     user = query_one("SELECT * FROM users WHERE username=%s", (username,))
     if not user or not check_password_hash(user["password_hash"], password):
+        remember_failed_login(attempt_key, attempts)
         return jsonify({"error": "Invalid username or password"}), 401
+    clear_failed_login(attempt_key)
     session.permanent = True
     session["user"] = {
         "id": user["id"],
@@ -473,27 +556,36 @@ def patients():
         missing = [field for field in required if not str(data.get(field, "")).strip()]
         if missing:
             return jsonify({"error": "Missing fields", "fields": missing}), 400
-        patient_id = data.get("patient_id", "").strip() or next_patient_id()
-        if query_one("SELECT id FROM patients WHERE patient_id=%s", (patient_id,)):
-            patient_id = next_patient_id()
-        new_id = execute(
-            """
-            INSERT INTO patients
-            (patient_id, name, age, gender, phone, date_of_visit, location_area, main_concern, created_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                patient_id,
-                data["name"].strip(),
-                int(data["age"]),
-                data["gender"],
-                data["phone"].strip(),
-                data["date_of_visit"],
-                data["location_area"].strip(),
-                data["main_concern"].strip(),
-                session["user"]["username"],
-            ),
-        )
+        conn = get_db()
+        cursor = conn.cursor()
+        try:
+            patient_id = next_patient_id(cursor)
+            cursor.execute(
+                """
+                INSERT INTO patients
+                (patient_id, name, age, gender, phone, date_of_visit, location_area, main_concern, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    patient_id,
+                    data["name"].strip(),
+                    int(data["age"]),
+                    data["gender"],
+                    data["phone"].strip(),
+                    data["date_of_visit"],
+                    data["location_area"].strip(),
+                    data["main_concern"].strip(),
+                    session["user"]["username"],
+                ),
+            )
+            new_id = cursor.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
         return jsonify({"message": "Patient registered", "id": new_id, "patient_id": patient_id}), 201
 
     search = request.args.get("search", "").strip()
@@ -519,8 +611,20 @@ def patient_detail(patient_id):
     if not existing:
         return jsonify({"error": "Patient not found"}), 404
     if request.method == "DELETE":
-        execute("UPDATE patients SET deleted_at=NOW() WHERE id=%s", (patient_id,))
-        return jsonify({"message": "Patient deleted"})
+        conn = get_db()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM appointments WHERE patient_db_id=%s", (patient_id,))
+            cursor.execute("DELETE FROM prescriptions WHERE patient_db_id=%s", (patient_id,))
+            cursor.execute("DELETE FROM patients WHERE id=%s", (patient_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+        return jsonify({"message": "Patient permanently deleted"})
 
     data = request.get_json(force=True)
     required = ["name", "age", "gender", "phone", "date_of_visit", "location_area", "main_concern"]
@@ -545,16 +649,6 @@ def patient_detail(patient_id):
         ),
     )
     return jsonify({"message": "Patient updated", "id": patient_id})
-
-
-@app.route("/api/patients/<int:patient_id>/restore", methods=["POST"])
-@login_required("receptionist")
-def restore_patient(patient_id):
-    existing = query_one("SELECT id FROM patients WHERE id=%s", (patient_id,))
-    if not existing:
-        return jsonify({"error": "Patient not found"}), 404
-    execute("UPDATE patients SET deleted_at=NULL WHERE id=%s", (patient_id,))
-    return jsonify({"message": "Patient restored", "id": patient_id})
 
 
 @app.route("/api/appointments", methods=["GET", "POST"])
@@ -599,29 +693,40 @@ def prescriptions():
             return jsonify({"error": "Only doctor can save prescriptions"}), 403
         data = request.get_json(force=True)
         patient_db_id = int(data["patient_db_id"])
-        prescription_no = f"RX-{date.today().strftime('%Y%m%d')}-{patient_db_id}-{query_one('SELECT COUNT(*) AS count FROM prescriptions')['count'] + 1}"
-        new_id = execute(
-            """
-            INSERT INTO prescriptions
-            (prescription_no, patient_db_id, prescription_date, follow_up_date, medicines, skin_products,
-             hair_products, session_recommended, session_type, treatment_notes, receptionist_instructions, created_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                prescription_no,
-                patient_db_id,
-                data["prescription_date"],
-                data.get("follow_up_date") or None,
-                json.dumps(normalize_json_list(data.get("medicines"))),
-                json.dumps(normalize_json_list(data.get("skin_products"))),
-                json.dumps(normalize_json_list(data.get("hair_products"))),
-                data.get("session_recommended", ""),
-                data.get("session_type", ""),
-                data.get("treatment_notes", ""),
-                data.get("receptionist_instructions", ""),
-                session["user"]["username"],
-            ),
-        )
+        conn = get_db()
+        cursor = conn.cursor()
+        try:
+            prescription_no = next_prescription_no(cursor)
+            cursor.execute(
+                """
+                INSERT INTO prescriptions
+                (prescription_no, patient_db_id, prescription_date, follow_up_date, medicines, skin_products,
+                 hair_products, session_recommended, session_type, treatment_notes, receptionist_instructions, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    prescription_no,
+                    patient_db_id,
+                    data["prescription_date"],
+                    data.get("follow_up_date") or None,
+                    json.dumps(normalize_json_list(data.get("medicines"))),
+                    json.dumps(normalize_json_list(data.get("skin_products"))),
+                    json.dumps(normalize_json_list(data.get("hair_products"))),
+                    data.get("session_recommended", ""),
+                    data.get("session_type", ""),
+                    data.get("treatment_notes", ""),
+                    data.get("receptionist_instructions", ""),
+                    session["user"]["username"],
+                ),
+            )
+            new_id = cursor.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
         return jsonify({"message": "Prescription saved", "id": new_id, "prescription_no": prescription_no}), 201
 
     rows = query_all(
@@ -670,8 +775,8 @@ def session_detail(session_id):
     if not existing:
         return jsonify({"error": "Session not found"}), 404
     if request.method == "DELETE":
-        execute("UPDATE prescriptions SET deleted_at=NOW() WHERE id=%s", (session_id,))
-        return jsonify({"message": "Session deleted", "id": session_id})
+        execute("DELETE FROM prescriptions WHERE id=%s", (session_id,))
+        return jsonify({"message": "Session permanently deleted", "id": session_id})
 
     data = request.get_json(force=True)
     execute(
@@ -693,16 +798,6 @@ def session_detail(session_id):
     return jsonify({"message": "Session updated", "id": session_id})
 
 
-@app.route("/api/sessions/<int:session_id>/restore", methods=["POST"])
-@login_required("receptionist")
-def restore_session(session_id):
-    existing = query_one("SELECT id FROM prescriptions WHERE id=%s", (session_id,))
-    if not existing:
-        return jsonify({"error": "Session not found"}), 404
-    execute("UPDATE prescriptions SET deleted_at=NULL WHERE id=%s", (session_id,))
-    return jsonify({"message": "Session restored", "id": session_id})
-
-
 @app.route("/api/prescriptions/<int:prescription_id>", methods=["PUT", "DELETE"])
 @login_required("doctor")
 def prescription_detail(prescription_id):
@@ -710,8 +805,8 @@ def prescription_detail(prescription_id):
     if not existing:
         return jsonify({"error": "Prescription not found"}), 404
     if request.method == "DELETE":
-        execute("UPDATE prescriptions SET deleted_at=NOW() WHERE id=%s", (prescription_id,))
-        return jsonify({"message": "Prescription deleted"})
+        execute("DELETE FROM prescriptions WHERE id=%s", (prescription_id,))
+        return jsonify({"message": "Prescription permanently deleted"})
 
     data = request.get_json(force=True)
     execute(
@@ -890,86 +985,6 @@ def backup():
     return app.response_class(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=clinic-backup.csv"})
 
 
-@app.route("/api/backup/import", methods=["POST"])
-@login_required()
-def import_backup():
-    uploaded = request.files.get("file")
-    if not uploaded:
-        return jsonify({"error": "Upload backup CSV"}), 400
-    content = uploaded.read().decode("utf-8-sig")
-    imported = 0
-    for row in csv.DictReader(StringIO(content)):
-        table = row.get("table")
-        payload = json.loads(row.get("payload") or "{}")
-        if table == "patients":
-            execute(
-                """
-                INSERT INTO patients (patient_id, name, age, gender, phone, date_of_visit, location_area, main_concern, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE name=VALUES(name), age=VALUES(age), gender=VALUES(gender), phone=VALUES(phone),
-                date_of_visit=VALUES(date_of_visit), location_area=VALUES(location_area), main_concern=VALUES(main_concern)
-                """,
-                (payload.get("patient_id"), payload.get("name"), payload.get("age"), payload.get("gender"), payload.get("phone"), payload.get("date_of_visit"), payload.get("location_area"), payload.get("main_concern"), session["user"]["username"]),
-            )
-            imported += 1
-        elif table == "catalog":
-            execute(
-                """
-                INSERT INTO product_catalog (name, category, default_dose, default_notes, created_by)
-                VALUES (%s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE default_dose=VALUES(default_dose), default_notes=VALUES(default_notes)
-                """,
-                (payload.get("name"), payload.get("category"), payload.get("default_dose"), payload.get("default_notes"), session["user"]["username"]),
-            )
-            imported += 1
-        elif table == "appointments":
-            execute(
-                """
-                INSERT INTO appointments (patient_db_id, appointment_date, appointment_time, doctor_name, status, notes, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    payload.get("patient_db_id"),
-                    payload.get("appointment_date"),
-                    payload.get("appointment_time"),
-                    payload.get("doctor_name", "Doctor"),
-                    payload.get("status", "Scheduled"),
-                    payload.get("notes", ""),
-                    session["user"]["username"],
-                ),
-            )
-            imported += 1
-        elif table == "prescriptions":
-            execute(
-                """
-                INSERT INTO prescriptions
-                (prescription_no, patient_db_id, prescription_date, follow_up_date, medicines, skin_products,
-                 hair_products, session_recommended, session_type, treatment_notes, receptionist_instructions, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE follow_up_date=VALUES(follow_up_date), medicines=VALUES(medicines),
-                skin_products=VALUES(skin_products), hair_products=VALUES(hair_products), session_recommended=VALUES(session_recommended),
-                session_type=VALUES(session_type), treatment_notes=VALUES(treatment_notes),
-                receptionist_instructions=VALUES(receptionist_instructions)
-                """,
-                (
-                    payload.get("prescription_no"),
-                    payload.get("patient_db_id"),
-                    payload.get("prescription_date"),
-                    payload.get("follow_up_date") or None,
-                    payload.get("medicines") or "[]",
-                    payload.get("skin_products") or "[]",
-                    payload.get("hair_products") or "[]",
-                    payload.get("session_recommended", ""),
-                    payload.get("session_type", ""),
-                    payload.get("treatment_notes", ""),
-                    payload.get("receptionist_instructions", ""),
-                    session["user"]["username"],
-                ),
-            )
-            imported += 1
-    return jsonify({"message": "Backup imported", "imported": imported})
-
-
 if __name__ == "__main__":
     init_database()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")
