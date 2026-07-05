@@ -1,6 +1,10 @@
 import json
 import os
 import csv
+import base64
+import binascii
+import hmac
+import hashlib
 import re
 import time
 from datetime import date, timedelta
@@ -42,10 +46,11 @@ app.config.update(
     SESSION_COOKIE_SECURE=session_cookie_secure.lower() == "true",
     PERMANENT_SESSION_LIFETIME=timedelta(days=int(os.getenv("SESSION_DAYS", "30"))),
 )
+cors_allowed_headers = ["Content-Type", "Authorization", "x-access-token", "token"]
 if cors_origins:
-    CORS(app, origins=cors_origins, supports_credentials=True)
+    CORS(app, origins=cors_origins, supports_credentials=True, allow_headers=cors_allowed_headers)
 else:
-    CORS(app, supports_credentials=True)
+    CORS(app, supports_credentials=True, allow_headers=cors_allowed_headers)
 database_ready = False
 login_attempts = {}
 LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "300"))
@@ -340,7 +345,7 @@ def init_database():
     seed_catalog()
 
 
-# Auth Helpers: session login and optional role checking for protected API routes.
+# Auth Helpers: JWT/session login and optional role checking for protected API routes.
 @app.before_request
 def ensure_database_ready():
     global database_ready
@@ -363,13 +368,82 @@ def handle_unexpected_error(error):
     return jsonify({"error": "Server error", "detail": str(error)}), 500
 
 
+def jwt_b64encode(value):
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def jwt_b64decode(value):
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def create_jwt(user):
+    now = int(time.time())
+    payload = {
+        "sub": str(user["id"]),
+        "username": user["username"],
+        "role": user["role"],
+        "full_name": user["full_name"],
+        "iat": now,
+        "exp": now + int(app.config["PERMANENT_SESSION_LIFETIME"].total_seconds()),
+    }
+    header = {"alg": "HS256", "typ": "JWT"}
+    signing_input = ".".join(
+        [
+            jwt_b64encode(json.dumps(header, separators=(",", ":")).encode("utf-8")),
+            jwt_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")),
+        ]
+    )
+    signature = hmac.new(app.secret_key.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest()
+    return f"{signing_input}.{jwt_b64encode(signature)}"
+
+
+def verify_jwt(token):
+    try:
+        header_part, payload_part, signature_part = token.split(".")
+        signing_input = f"{header_part}.{payload_part}"
+        expected_signature = hmac.new(app.secret_key.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256).digest()
+        supplied_signature = jwt_b64decode(signature_part)
+        if not hmac.compare_digest(expected_signature, supplied_signature):
+            return None
+        payload = json.loads(jwt_b64decode(payload_part))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return {
+            "id": int(payload["sub"]),
+            "username": payload["username"],
+            "role": payload["role"],
+            "full_name": payload["full_name"],
+        }
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, binascii.Error, UnicodeDecodeError):
+        return None
+
+
+def bearer_token_from_request():
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    return request.headers.get("x-access-token") or request.headers.get("token")
+
+
+def current_user():
+    token = bearer_token_from_request()
+    if token:
+        user = verify_jwt(token)
+        if user:
+            return user
+    return session.get("user")
+
+
 def login_required(role=None):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            if "user" not in session:
+            user = current_user()
+            if not user:
                 return jsonify({"error": "Login required"}), 401
-            if role and session["user"]["role"] != role:
+            session["user"] = user
+            if role and user["role"] != role:
                 return jsonify({"error": "Access denied"}), 403
             return fn(*args, **kwargs)
 
@@ -517,7 +591,7 @@ def login():
         "role": user["role"],
         "full_name": user["full_name"],
     }
-    return jsonify({"user": session["user"]})
+    return jsonify({"user": session["user"], "token": create_jwt(session["user"])})
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -528,7 +602,7 @@ def logout():
 
 @app.route("/api/me")
 def me():
-    return jsonify({"user": session.get("user")})
+    return jsonify({"user": current_user()})
 
 
 @app.route("/api/dashboard")
@@ -539,12 +613,36 @@ def dashboard():
     today_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit=%s", (today,))["count"]
     appointments = query_one("SELECT COUNT(*) AS count FROM appointments WHERE appointment_date=%s", (today,))["count"]
     prescriptions = query_one("SELECT COUNT(*) AS count FROM prescriptions")["count"]
+    gender_rows = query_all("SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender")
+    patients_by_gender = {"Female": 0, "Male": 0, "Other": 0}
+    for row in gender_rows:
+        patients_by_gender[row["gender"]] = row["count"]
+    total_sessions = query_one(
+        """
+        SELECT COUNT(*) AS count FROM prescriptions
+        WHERE COALESCE(session_recommended, '') <> '' OR COALESCE(session_type, '') <> ''
+        """
+    )["count"]
+    session_rows = query_all(
+        """
+        SELECT pr.id, pr.prescription_date, pr.follow_up_date, pr.session_recommended, pr.session_type,
+               pr.treatment_notes, pr.receptionist_instructions, p.patient_id, p.name AS patient_name
+        FROM prescriptions pr
+        JOIN patients p ON p.id = pr.patient_db_id
+        WHERE COALESCE(pr.session_recommended, '') <> '' OR COALESCE(pr.session_type, '') <> ''
+        ORDER BY pr.prescription_date DESC, pr.created_at DESC
+        LIMIT 8
+        """
+    )
     return jsonify(
         {
             "totalPatients": total_patients,
             "todayPatients": today_patients,
             "todayAppointments": appointments,
             "prescriptions": prescriptions,
+            "totalSessions": total_sessions,
+            "patientsByGender": patients_by_gender,
+            "recentSessions": [row_dates_to_string(row) for row in session_rows],
         }
     )
 
