@@ -8,11 +8,11 @@ load_dotenv()
 
 def db_config():
     return {
-        "host": os.getenv("MYSQL_HOST", "localhost"),
+        "host": os.getenv("MYSQL_HOST", "srv2220.hstgr.io"),
         "port": int(os.getenv("MYSQL_PORT", "3306")),
-        "user": os.getenv("MYSQL_USER", "root"),
-        "password": os.getenv("MYSQL_PASSWORD", ""),
-        "database": os.getenv("MYSQL_DATABASE", "clinic"),
+        "user": os.getenv("MYSQL_USER", "u367206649_clinic_user"),
+        "password": os.getenv("MYSQL_PASSWORD", "Clinic@2026!"),
+        "database": os.getenv("MYSQL_DATABASE", "u367206649_clinic"),
         "autocommit": False,
     }
 
@@ -44,4 +44,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
