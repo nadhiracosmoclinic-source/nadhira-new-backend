@@ -11,7 +11,7 @@ import mysql.connector
 from mysql.connector import errorcode
 from openpyxl import load_workbook
 from dotenv import load_dotenv
-from flask import Flask, abort, jsonify, request, send_from_directory, session
+from flask import Flask, abort, jsonify, make_response, request, send_from_directory, session
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError
 from werkzeug.exceptions import HTTPException
@@ -30,7 +30,7 @@ app = Flask(__name__, static_folder=None)
 app.secret_key = os.getenv("SECRET_KEY", "change-this-secret-key")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-is_production = bool(os.getenv("RENDER") or os.getenv("FRONTEND_ORIGINS"))
+is_production = bool(os.getenv("RENDER"))
 session_cookie_samesite = os.getenv("SESSION_COOKIE_SAMESITE") or ("None" if is_production else "Lax")
 session_cookie_secure = os.getenv("SESSION_COOKIE_SECURE")
 if session_cookie_secure is None:
@@ -476,11 +476,15 @@ def catalog_rows_from_upload(file_storage):
 def home():
     if not os.path.exists(os.path.join(FRONTEND_DIR, "index.html")):
         return jsonify({"status": "ok", "service": "clinic backend"})
-    return send_from_directory(FRONTEND_DIR, "index.html")
+    response = make_response(send_from_directory(FRONTEND_DIR, "index.html"))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/<path:filename>")
 def frontend_file(filename):
+    if filename.startswith("api/"):
+        return jsonify({"error": "API endpoint not found"}), 404
     if not os.path.exists(os.path.join(FRONTEND_DIR, filename)):
         abort(404)
     return send_from_directory(FRONTEND_DIR, filename)
