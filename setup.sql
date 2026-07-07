@@ -87,3 +87,38 @@ CREATE TABLE IF NOT EXISTS product_catalog (
     INDEX idx_catalog_name (name),
     INDEX idx_catalog_category (category)
 );
+
+
+CREATE TABLE IF NOT EXISTS notifications (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    role ENUM('receptionist', 'doctor', 'all') NOT NULL DEFAULT 'all',
+    category VARCHAR(40) NOT NULL,
+    title VARCHAR(180) NOT NULL,
+    message TEXT,
+    target_view VARCHAR(40),
+    entity_type VARCHAR(40),
+    entity_id INT,
+    is_read TINYINT(1) NOT NULL DEFAULT 0,
+    created_by VARCHAR(80) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    read_at TIMESTAMP NULL,
+    INDEX idx_notifications_role_read (role, is_read, created_at),
+    INDEX idx_notifications_created (created_at)
+);
+
+CREATE TABLE IF NOT EXISTS activity_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    activity_date DATE NOT NULL,
+    category VARCHAR(40) NOT NULL,
+    title VARCHAR(180) NOT NULL,
+    message TEXT,
+    entity_type VARCHAR(40),
+    entity_id INT,
+    created_by VARCHAR(80) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_activity_date (activity_date, created_at),
+    INDEX idx_activity_entity (entity_type, entity_id)
+);
+
+CREATE INDEX idx_appointment_status_date ON appointments (status, appointment_date);
+CREATE INDEX idx_prescription_follow_up ON prescriptions (follow_up_date);
