@@ -258,6 +258,39 @@ def create_tables():
             INDEX idx_prescription_patient (patient_db_id)
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            role ENUM('receptionist', 'doctor', 'all') NOT NULL DEFAULT 'all',
+            category VARCHAR(40) NOT NULL,
+            title VARCHAR(180) NOT NULL,
+            message TEXT,
+            target_view VARCHAR(40),
+            entity_type VARCHAR(40),
+            entity_id INT,
+            is_read TINYINT(1) NOT NULL DEFAULT 0,
+            created_by VARCHAR(80) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            read_at TIMESTAMP NULL,
+            INDEX idx_notifications_role_read (role, is_read, created_at),
+            INDEX idx_notifications_created (created_at)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            activity_date DATE NOT NULL,
+            category VARCHAR(40) NOT NULL,
+            title VARCHAR(180) NOT NULL,
+            message TEXT,
+            entity_type VARCHAR(40),
+            entity_id INT,
+            created_by VARCHAR(80) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_activity_date (activity_date, created_at),
+            INDEX idx_activity_entity (entity_type, entity_id)
+        )
+        """,
     ]
     conn = get_db()
     cursor = conn.cursor()
@@ -287,6 +320,8 @@ def ensure_production_schema():
     for statement in [
         "CREATE INDEX idx_patient_created ON patients (created_at)",
         "CREATE INDEX idx_prescription_created ON prescriptions (created_at)",
+        "CREATE INDEX idx_appointment_status_date ON appointments (status, appointment_date)",
+        "CREATE INDEX idx_prescription_follow_up ON prescriptions (follow_up_date)",
     ]:
         try:
             cursor.execute(statement)
@@ -494,6 +529,42 @@ def parse_json_field(value):
     return value or []
 
 
+def user_role_target(role):
+    return role if role in {"receptionist", "doctor"} else "all"
+
+
+def record_activity(category, title, message="", entity_type=None, entity_id=None, created_by="system", role="all", target_view=None, conn=None):
+    owns_connection = conn is None
+    if conn is None:
+        conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            INSERT INTO activity_logs (activity_date, category, title, message, entity_type, entity_id, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (date.today(), category, title, message, entity_type, entity_id, created_by),
+        )
+        cursor.execute(
+            """
+            INSERT INTO notifications (role, category, title, message, target_view, entity_type, entity_id, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (user_role_target(role), category, title, message, target_view, entity_type, entity_id, created_by),
+        )
+        if owns_connection:
+            conn.commit()
+    except Exception:
+        if owns_connection:
+            conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        if owns_connection:
+            conn.close()
+
+
 def next_sequence_value(cursor, table_name):
     if table_name not in {"patient_id_sequences", "prescription_sequences"}:
         raise ValueError("Invalid sequence table")
@@ -609,20 +680,70 @@ def me():
 @login_required()
 def dashboard():
     today = date.today().isoformat()
+    week_start = (date.today() - timedelta(days=6)).isoformat()
+    month_start = date.today().replace(day=1).isoformat()
     total_patients = query_one("SELECT COUNT(*) AS count FROM patients")["count"]
     today_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit=%s", (today,))["count"]
-    appointments = query_one("SELECT COUNT(*) AS count FROM appointments WHERE appointment_date=%s", (today,))["count"]
-    prescriptions = query_one("SELECT COUNT(*) AS count FROM prescriptions")["count"]
-    gender_rows = query_all("SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender")
-    patients_by_gender = {"Female": 0, "Male": 0, "Other": 0}
-    for row in gender_rows:
-        patients_by_gender[row["gender"]] = row["count"]
-    total_sessions = query_one(
+    total_prescriptions = query_one("SELECT COUNT(*) AS count FROM prescriptions")["count"]
+    today_prescriptions = query_one("SELECT COUNT(*) AS count FROM prescriptions WHERE prescription_date=%s", (today,))["count"]
+    total_appointments = query_one("SELECT COUNT(*) AS count FROM appointments")["count"]
+    today_appointments = query_one("SELECT COUNT(*) AS count FROM appointments WHERE appointment_date=%s", (today,))["count"]
+    upcoming_appointments = query_one(
+        "SELECT COUNT(*) AS count FROM appointments WHERE appointment_date >= %s AND status='Scheduled'",
+        (today,),
+    )["count"]
+    new_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE DATE(created_at)=%s", (today,))["count"]
+    follow_ups = query_one("SELECT COUNT(*) AS count FROM prescriptions WHERE follow_up_date >= %s", (today,))["count"]
+    sessions_completed = query_one(
         """
         SELECT COUNT(*) AS count FROM prescriptions
         WHERE COALESCE(session_recommended, '') <> '' OR COALESCE(session_type, '') <> ''
         """
     )["count"]
+    gender_rows = query_all("SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender")
+    patients_by_gender = {"Female": 0, "Male": 0, "Other": 0}
+    for row in gender_rows:
+        patients_by_gender[row["gender"]] = row["count"]
+    stats_rows = query_all(
+        """
+        SELECT activity_date,
+               SUM(category='patient') AS patients,
+               SUM(category='prescription') AS prescriptions,
+               SUM(category='appointment') AS appointments,
+               SUM(category IN ('session', 'follow_up')) AS sessions
+        FROM activity_logs
+        WHERE activity_date >= %s
+        GROUP BY activity_date
+        ORDER BY activity_date ASC
+        """,
+        (week_start,),
+    )
+    monthly_rows = query_all(
+        """
+        SELECT activity_date, COUNT(*) AS count
+        FROM activity_logs
+        WHERE activity_date >= %s
+        GROUP BY activity_date
+        ORDER BY activity_date ASC
+        """,
+        (month_start,),
+    )
+    recent_activities = query_all(
+        """
+        SELECT id, activity_date, category, title, message, entity_type, entity_id, created_by, created_at
+        FROM activity_logs
+        ORDER BY created_at DESC
+        LIMIT 10
+        """
+    )
+    recent_registrations = query_all(
+        """
+        SELECT id, patient_id, name, phone, date_of_visit, created_at
+        FROM patients
+        ORDER BY created_at DESC
+        LIMIT 8
+        """
+    )
     session_rows = query_all(
         """
         SELECT pr.id, pr.prescription_date, pr.follow_up_date, pr.session_recommended, pr.session_type,
@@ -634,17 +755,26 @@ def dashboard():
         LIMIT 8
         """
     )
-    return jsonify(
-        {
-            "totalPatients": total_patients,
-            "todayPatients": today_patients,
-            "todayAppointments": appointments,
-            "prescriptions": prescriptions,
-            "totalSessions": total_sessions,
-            "patientsByGender": patients_by_gender,
-            "recentSessions": [row_dates_to_string(row) for row in session_rows],
-        }
-    )
+    return jsonify({
+        "totalPatients": total_patients,
+        "todayPatients": today_patients,
+        "malePatients": patients_by_gender["Male"],
+        "femalePatients": patients_by_gender["Female"],
+        "followUps": follow_ups,
+        "newPatients": new_patients,
+        "totalPrescriptions": total_prescriptions,
+        "todayPrescriptions": today_prescriptions,
+        "appointments": total_appointments,
+        "todayAppointments": today_appointments,
+        "upcomingAppointments": upcoming_appointments,
+        "sessionsCompleted": sessions_completed,
+        "patientsByGender": patients_by_gender,
+        "dailyStats": [row_dates_to_string(row) for row in stats_rows],
+        "monthlyStats": [row_dates_to_string(row) for row in monthly_rows],
+        "recentActivities": [row_dates_to_string(row) for row in recent_activities],
+        "recentRegistrations": [row_dates_to_string(row) for row in recent_registrations],
+        "recentSessions": [row_dates_to_string(row) for row in session_rows],
+    })
 
 
 @app.route("/api/patients", methods=["GET", "POST"])
@@ -681,6 +811,7 @@ def patients():
                 ),
             )
             new_id = cursor.lastrowid
+            record_activity("patient", "New patient registered", f"{data['name'].strip()} ({patient_id})", "patient", new_id, session["user"]["username"], "doctor", "patients", conn)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -750,13 +881,16 @@ def patient_detail(patient_id):
             patient_id,
         ),
     )
+    record_activity("patient", "Patient updated", data["name"].strip(), "patient", patient_id, session["user"]["username"], "doctor", "patients")
     return jsonify({"message": "Patient updated", "id": patient_id})
 
 
 @app.route("/api/appointments", methods=["GET", "POST"])
-@login_required("receptionist")
+@login_required()
 def appointments():
     if request.method == "POST":
+        if session["user"]["role"] != "receptionist":
+            return jsonify({"error": "Only receptionist can save appointments"}), 403
         data = request.get_json(force=True)
         new_id = execute(
             """
@@ -774,6 +908,7 @@ def appointments():
                 session["user"]["username"],
             ),
         )
+        record_activity("appointment", "Appointment saved", data.get("appointment_date", ""), "appointment", new_id, session["user"]["username"], "doctor", "appointments")
         return jsonify({"message": "Appointment saved", "id": new_id}), 201
 
     rows = query_all(
@@ -822,6 +957,11 @@ def prescriptions():
                 ),
             )
             new_id = cursor.lastrowid
+            record_activity("prescription", "Prescription saved", prescription_no, "prescription", new_id, session["user"]["username"], "receptionist", "history", conn)
+            if data.get("follow_up_date"):
+                record_activity("follow_up", "Follow-up scheduled", str(data.get("follow_up_date")), "prescription", new_id, session["user"]["username"], "receptionist", "sessions", conn)
+            if data.get("session_recommended") or data.get("session_type"):
+                record_activity("session", "Session recommended", data.get("session_type", ""), "prescription", new_id, session["user"]["username"], "receptionist", "sessions", conn)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -897,6 +1037,7 @@ def session_detail(session_id):
             session_id,
         ),
     )
+    record_activity("session", "Session updated", data.get("session_type", ""), "prescription", session_id, session["user"]["username"], "doctor", "sessions")
     return jsonify({"message": "Session updated", "id": session_id})
 
 
@@ -933,7 +1074,88 @@ def prescription_detail(prescription_id):
             prescription_id,
         ),
     )
+    record_activity("prescription", "Prescription updated", existing["prescription_no"], "prescription", prescription_id, session["user"]["username"], "receptionist", "history")
     return jsonify({"message": "Prescription updated", "id": prescription_id, "prescription_no": existing["prescription_no"]})
+
+
+@app.route("/api/notifications")
+@login_required()
+def notifications():
+    user = current_user()
+    rows = query_all(
+        """
+        SELECT id, role, category, title, message, target_view, entity_type, entity_id, is_read, created_at, read_at
+        FROM notifications
+        WHERE role IN (%s, 'all')
+        ORDER BY created_at DESC
+        LIMIT 40
+        """,
+        (user["role"],),
+    )
+    unread = query_one(
+        "SELECT COUNT(*) AS count FROM notifications WHERE role IN (%s, 'all') AND is_read=0",
+        (user["role"],),
+    )["count"]
+    return jsonify({"unread": unread, "items": [row_dates_to_string(row) for row in rows]})
+
+
+@app.route("/api/notifications/<int:notification_id>/read", methods=["POST"])
+@login_required()
+def mark_notification_read(notification_id):
+    user = current_user()
+    execute(
+        """
+        UPDATE notifications
+        SET is_read=1, read_at=NOW()
+        WHERE id=%s AND role IN (%s, 'all')
+        """,
+        (notification_id, user["role"]),
+    )
+    return jsonify({"message": "Notification marked read", "id": notification_id})
+
+
+@app.route("/api/archive/daily")
+@login_required("receptionist")
+def daily_archive():
+    archive_date = request.args.get("date", date.today().isoformat())
+    patients = query_all(
+        "SELECT id, patient_id, name, phone, date_of_visit, main_concern, created_at FROM patients WHERE date_of_visit=%s ORDER BY created_at DESC",
+        (archive_date,),
+    )
+    prescriptions = query_all(
+        """
+        SELECT pr.id, pr.prescription_no, pr.prescription_date, pr.follow_up_date, pr.session_recommended, pr.session_type,
+               p.patient_id, p.name AS patient_name
+        FROM prescriptions pr
+        JOIN patients p ON p.id = pr.patient_db_id
+        WHERE pr.prescription_date=%s OR pr.follow_up_date=%s
+        ORDER BY pr.created_at DESC
+        """,
+        (archive_date, archive_date),
+    )
+    appointments = query_all(
+        """
+        SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.notes, p.patient_id, p.name AS patient_name
+        FROM appointments a
+        JOIN patients p ON p.id = a.patient_db_id
+        WHERE a.appointment_date=%s
+        ORDER BY a.appointment_time ASC
+        """,
+        (archive_date,),
+    )
+    activities = query_all(
+        "SELECT id, category, title, message, entity_type, entity_id, created_by, created_at FROM activity_logs WHERE activity_date=%s ORDER BY created_at DESC",
+        (archive_date,),
+    )
+    return jsonify({
+        "date": archive_date,
+        "patients": [row_dates_to_string(row) for row in patients],
+        "prescriptions": [row_dates_to_string(row) for row in prescriptions],
+        "appointments": [row_dates_to_string(row) for row in appointments],
+        "sessions": [row_dates_to_string(row) for row in prescriptions if row.get("session_recommended") or row.get("session_type")],
+        "reports": {"patients": len(patients), "prescriptions": len(prescriptions), "appointments": len(appointments)},
+        "activityLogs": [row_dates_to_string(row) for row in activities],
+    })
 
 
 @app.route("/api/reports")
