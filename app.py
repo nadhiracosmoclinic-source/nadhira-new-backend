@@ -114,6 +114,7 @@ def db_config():
         "password": os.getenv("MYSQL_PASSWORD", ""),
         "database": os.getenv("MYSQL_DATABASE", "clinic"),
         "autocommit": False,
+        "connection_timeout": int(os.getenv("MYSQL_CONNECTION_TIMEOUT", "10")),
     }
 
 
@@ -384,7 +385,9 @@ def init_database():
 @app.before_request
 def ensure_database_ready():
     global database_ready
-    if not database_ready and request.path.startswith("/api/"):
+    # Health must stay database-free so hosting health checks and cold-start
+    # wake-ups respond immediately even while MySQL is still connecting.
+    if not database_ready and request.path.startswith("/api/") and request.path != "/api/health":
         init_database()
         database_ready = True
 
@@ -637,8 +640,7 @@ def frontend_file(filename):
 
 @app.route("/api/health")
 def health():
-    catalog_count = query_one("SELECT COUNT(*) AS count FROM product_catalog")["count"]
-    return jsonify({"status": "ok", "database": os.getenv("MYSQL_DATABASE", "clinic"), "catalog": catalog_count})
+    return jsonify({"status": "ok", "service": "nadhira-app", "database_ready": database_ready})
 
 
 # API Routes: authentication, patients, appointments, prescriptions, medicine library, exports, and backups.
