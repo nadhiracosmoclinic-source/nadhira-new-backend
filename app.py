@@ -590,7 +590,7 @@ def next_patient_id(cursor):
 
 def next_prescription_no(cursor):
     today_value, number = next_sequence_value(cursor, "prescription_sequences")
-    return f"RX-{today_value.strftime('%Y%m%d')}-{number:06d}"
+    return f"PT-{today_value.strftime('%Y%m%d')}-{number:06d}"
 
 
 def rows_to_csv(rows, headers):
