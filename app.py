@@ -7,13 +7,14 @@ import hmac
 import hashlib
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from functools import wraps
 from io import BytesIO, StringIO
 
 import mysql.connector
 from mysql.connector import errorcode
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, make_response, request, send_from_directory, session
 from flask_cors import CORS
@@ -55,6 +56,7 @@ database_ready = False
 login_attempts = {}
 LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "300"))
 LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "8"))
+CLINIC_TZ = ZoneInfo("Asia/Kolkata")
 
 if is_production and app.secret_key == "change-this-secret-key":
     raise RuntimeError("SECRET_KEY must be set to a strong random value in production")
@@ -119,22 +121,11 @@ def db_config():
 
 
 def get_db():
-    config = db_config()
-    try:
-        return mysql.connector.connect(**config)
-    except MySQLError as error:
-        if error.errno != errorcode.ER_BAD_DB_ERROR:
-            raise
-        database = config.pop("database")
-        if not re.match(r"^[A-Za-z0-9_]+$", database):
-            raise
-        conn = mysql.connector.connect(**config)
-        cursor = conn.cursor()
-        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return mysql.connector.connect(**db_config())
+    conn = mysql.connector.connect(**db_config())
+    cursor = conn.cursor()
+    cursor.execute("SET time_zone = '+05:30'")
+    cursor.close()
+    return conn
 
 
 def query_all(sql, params=None):
@@ -184,6 +175,7 @@ def create_tables():
             gender ENUM('Female', 'Male', 'Other') NOT NULL,
             phone VARCHAR(30) NOT NULL,
             date_of_visit DATE NOT NULL,
+            daily_patient_number INT NULL,
             location_area VARCHAR(180) NOT NULL,
             main_concern TEXT NOT NULL,
             created_by VARCHAR(80) NOT NULL,
@@ -212,6 +204,13 @@ def create_tables():
         """,
         """
         CREATE TABLE IF NOT EXISTS patient_id_sequences (
+            sequence_date DATE PRIMARY KEY,
+            next_number INT NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS daily_patient_sequences (
             sequence_date DATE PRIMARY KEY,
             next_number INT NOT NULL DEFAULT 1,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -307,19 +306,18 @@ def ensure_production_schema():
     conn = get_db()
     cursor = conn.cursor()
     database = os.getenv("MYSQL_DATABASE", "clinic")
-    for table in ["patients", "prescriptions"]:
-        cursor.execute(
-            """
-            SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_NAME='deleted_at'
-            """,
-            (database, table),
-        )
-        exists = cursor.fetchone()[0]
-        if exists:
-            cursor.execute(f"ALTER TABLE {table} DROP COLUMN deleted_at")
+    # Schema upgrades must remain additive. In particular, never remove legacy
+    # columns: deployments may still depend on them and they can contain data.
+    cursor.execute(
+        """SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA=%s AND TABLE_NAME='patients' AND COLUMN_NAME='daily_patient_number'""",
+        (database,),
+    )
+    if not cursor.fetchone()[0]:
+        cursor.execute("ALTER TABLE patients ADD COLUMN daily_patient_number INT NULL")
     for statement in [
         "CREATE INDEX idx_patient_created ON patients (created_at)",
+        "CREATE UNIQUE INDEX uq_patient_date_daily_number ON patients (date_of_visit, daily_patient_number)",
         "CREATE INDEX idx_prescription_created ON prescriptions (created_at)",
         "CREATE INDEX idx_appointment_status_date ON appointments (status, appointment_date)",
         "CREATE INDEX idx_prescription_follow_up ON prescriptions (follow_up_date)",
@@ -335,10 +333,11 @@ def ensure_production_schema():
 
 
 def seed_users():
-    users = [
-        ("reception", "Reception@123", "receptionist", "Receptionist"),
-        ("doctor", "Doctor@123", "doctor", "Doctor"),
-    ]
+    users = []
+    for prefix, role, label in [("INITIAL_RECEPTION", "receptionist", "Reception"), ("INITIAL_DOCTOR", "doctor", "Doctor")]:
+        username, password = os.getenv(f"{prefix}_USERNAME", "").strip(), os.getenv(f"{prefix}_PASSWORD", "")
+        if username and password:
+            users.append((username, password, role, label))
     for username, password, role, full_name in users:
         existing = query_one("SELECT id FROM users WHERE username=%s", (username,))
         if not existing:
@@ -395,7 +394,7 @@ def ensure_database_ready():
 @app.errorhandler(MySQLError)
 def handle_mysql_error(error):
     app.logger.exception("MySQL error")
-    return jsonify({"error": "Database connection failed", "detail": str(error)}), 503
+    return jsonify({"error": "The service is temporarily unavailable. Please try again."}), 503
 
 
 @app.errorhandler(Exception)
@@ -403,7 +402,7 @@ def handle_unexpected_error(error):
     if isinstance(error, HTTPException):
         return error
     app.logger.exception("Unexpected error")
-    return jsonify({"error": "Server error", "detail": str(error)}), 500
+    return jsonify({"error": "The request could not be completed. Please try again."}), 500
 
 
 def jwt_b64encode(value):
@@ -547,7 +546,7 @@ def record_activity(category, title, message="", entity_type=None, entity_id=Non
             INSERT INTO activity_logs (activity_date, category, title, message, entity_type, entity_id, created_by)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (date.today(), category, title, message, entity_type, entity_id, created_by),
+            (datetime.now(CLINIC_TZ).date(), category, title, message, entity_type, entity_id, created_by),
         )
         cursor.execute(
             """
@@ -569,9 +568,9 @@ def record_activity(category, title, message="", entity_type=None, entity_id=Non
 
 
 def next_sequence_value(cursor, table_name):
-    if table_name not in {"patient_id_sequences", "prescription_sequences"}:
+    if table_name not in {"patient_id_sequences", "prescription_sequences", "daily_patient_sequences"}:
         raise ValueError("Invalid sequence table")
-    today_value = date.today()
+    today_value = datetime.now(CLINIC_TZ).date()
     cursor.execute(
         f"INSERT IGNORE INTO {table_name} (sequence_date, next_number) VALUES (%s, 1)",
         (today_value,),
@@ -581,6 +580,18 @@ def next_sequence_value(cursor, table_name):
     number = int(row[0])
     cursor.execute(f"UPDATE {table_name} SET next_number=%s WHERE sequence_date=%s", (number + 1, today_value))
     return today_value, number
+
+
+def next_daily_patient_number(cursor, visit_date):
+    visit_day = date.fromisoformat(str(visit_date))
+    cursor.execute(
+        "INSERT IGNORE INTO daily_patient_sequences (sequence_date, next_number) VALUES (%s, 1)",
+        (visit_day,),
+    )
+    cursor.execute("SELECT next_number FROM daily_patient_sequences WHERE sequence_date=%s FOR UPDATE", (visit_day,))
+    number = int(cursor.fetchone()[0])
+    cursor.execute("UPDATE daily_patient_sequences SET next_number=%s WHERE sequence_date=%s", (number + 1, visit_day))
+    return number
 
 
 def next_patient_id(cursor):
@@ -681,20 +692,37 @@ def me():
 @app.route("/api/dashboard")
 @login_required()
 def dashboard():
-    today = date.today().isoformat()
-    week_start = (date.today() - timedelta(days=6)).isoformat()
-    month_start = date.today().replace(day=1).isoformat()
+    clinic_today = datetime.now(CLINIC_TZ).date()
+    today = clinic_today.isoformat()
+    selected_date = request.args.get("date", today)
+    date_from = request.args.get("date_from", selected_date)
+    date_to = request.args.get("date_to", selected_date)
+    try:
+        start_day, end_day = date.fromisoformat(date_from), date.fromisoformat(date_to)
+        if end_day < start_day or (end_day - start_day).days > 3660:
+            raise ValueError("Invalid date range")
+    except ValueError:
+        return jsonify({"error": "Invalid date range"}), 400
+    week_start = (end_day - timedelta(days=6)).isoformat()
+    month_start = end_day.replace(day=1).isoformat()
     total_patients = query_one("SELECT COUNT(*) AS count FROM patients")["count"]
     today_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit=%s", (today,))["count"]
+    selected_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (date_from, date_to))["count"]
+    returning_patients = query_one(
+        """SELECT COUNT(*) AS count FROM patients p WHERE p.date_of_visit BETWEEN %s AND %s
+           AND EXISTS (SELECT 1 FROM patients old WHERE old.phone=p.phone AND old.date_of_visit<p.date_of_visit)""",
+        (date_from, date_to),
+    )["count"]
     total_prescriptions = query_one("SELECT COUNT(*) AS count FROM prescriptions")["count"]
     today_prescriptions = query_one("SELECT COUNT(*) AS count FROM prescriptions WHERE prescription_date=%s", (today,))["count"]
     total_appointments = query_one("SELECT COUNT(*) AS count FROM appointments")["count"]
     today_appointments = query_one("SELECT COUNT(*) AS count FROM appointments WHERE appointment_date=%s", (today,))["count"]
+    selected_appointments = query_one("SELECT COUNT(*) AS count FROM appointments WHERE appointment_date BETWEEN %s AND %s", (date_from, date_to))["count"]
     upcoming_appointments = query_one(
         "SELECT COUNT(*) AS count FROM appointments WHERE appointment_date >= %s AND status='Scheduled'",
         (today,),
     )["count"]
-    new_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE DATE(created_at)=%s", (today,))["count"]
+    new_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (date_from, date_to))["count"] - returning_patients
     follow_ups = query_one("SELECT COUNT(*) AS count FROM prescriptions WHERE follow_up_date >= %s", (today,))["count"]
     sessions_completed = query_one(
         """
@@ -714,37 +742,47 @@ def dashboard():
                SUM(category='appointment') AS appointments,
                SUM(category IN ('session', 'follow_up')) AS sessions
         FROM activity_logs
-        WHERE activity_date >= %s
+        WHERE activity_date BETWEEN %s AND %s
         GROUP BY activity_date
         ORDER BY activity_date ASC
         """,
-        (week_start,),
+        (date_from, date_to),
     )
     monthly_rows = query_all(
         """
         SELECT activity_date, COUNT(*) AS count
         FROM activity_logs
-        WHERE activity_date >= %s
+        WHERE activity_date BETWEEN %s AND %s
         GROUP BY activity_date
         ORDER BY activity_date ASC
         """,
-        (month_start,),
+        (month_start, date_to),
     )
     recent_activities = query_all(
         """
         SELECT id, activity_date, category, title, message, entity_type, entity_id, created_by, created_at
         FROM activity_logs
+        WHERE activity_date BETWEEN %s AND %s
         ORDER BY created_at DESC
         LIMIT 10
-        """
+        """,
+        (date_from, date_to),
     )
     recent_registrations = query_all(
         """
-        SELECT id, patient_id, name, phone, date_of_visit, created_at
+        SELECT id, patient_id, daily_patient_number, name, phone, date_of_visit, created_at
         FROM patients
+        WHERE date_of_visit BETWEEN %s AND %s
         ORDER BY created_at DESC
         LIMIT 8
-        """
+        """,
+        (date_from, date_to),
+    )
+    selected_patient_rows = query_all(
+        """SELECT id, patient_id, daily_patient_number, name, phone, date_of_visit, created_at, created_by
+           FROM patients WHERE date_of_visit BETWEEN %s AND %s
+           ORDER BY date_of_visit DESC, daily_patient_number IS NULL, daily_patient_number, created_at LIMIT 500""",
+        (date_from, date_to),
     )
     session_rows = query_all(
         """
@@ -752,14 +790,24 @@ def dashboard():
                pr.treatment_notes, pr.receptionist_instructions, p.patient_id, p.name AS patient_name
         FROM prescriptions pr
         JOIN patients p ON p.id = pr.patient_db_id
-        WHERE COALESCE(pr.session_recommended, '') <> '' OR COALESCE(pr.session_type, '') <> ''
+        WHERE pr.prescription_date BETWEEN %s AND %s
+          AND (COALESCE(pr.session_recommended, '') <> '' OR COALESCE(pr.session_type, '') <> '')
         ORDER BY pr.prescription_date DESC, pr.created_at DESC
         LIMIT 8
-        """
+        """,
+        (date_from, date_to),
     )
     return jsonify({
         "totalPatients": total_patients,
         "todayPatients": today_patients,
+        "selectedPatients": selected_patients,
+        "selectedDateFrom": date_from,
+        "selectedDateTo": date_to,
+        "returningPatients": returning_patients,
+        "thisWeekPatients": query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (week_start, date_to))["count"],
+        "thisMonthPatients": query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (month_start, date_to))["count"],
+        "totalVisits": total_patients,
+        "dailyPatients": [row_dates_to_string(row) for row in selected_patient_rows],
         "malePatients": patients_by_gender["Male"],
         "femalePatients": patients_by_gender["Female"],
         "followUps": follow_ups,
@@ -768,6 +816,7 @@ def dashboard():
         "todayPrescriptions": today_prescriptions,
         "appointments": total_appointments,
         "todayAppointments": today_appointments,
+        "selectedAppointments": selected_appointments,
         "upcomingAppointments": upcoming_appointments,
         "sessionsCompleted": sessions_completed,
         "patientsByGender": patients_by_gender,
@@ -790,20 +839,29 @@ def patients():
         missing = [field for field in required if not str(data.get(field, "")).strip()]
         if missing:
             return jsonify({"error": "Missing fields", "fields": missing}), 400
+        try:
+            visit_day = date.fromisoformat(data["date_of_visit"])
+            age = int(data["age"])
+        except (ValueError, TypeError):
+            return jsonify({"error": "Enter a valid visit date and age."}), 400
+        if age < 1 or age > 120 or data["gender"] not in {"Female", "Male", "Other"}:
+            return jsonify({"error": "Enter a valid age and gender."}), 400
         conn = get_db()
         cursor = conn.cursor()
         try:
             patient_id = next_patient_id(cursor)
+            daily_number = next_daily_patient_number(cursor, visit_day.isoformat())
             cursor.execute(
                 """
                 INSERT INTO patients
-                (patient_id, name, age, gender, phone, date_of_visit, location_area, main_concern, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (patient_id, daily_patient_number, name, age, gender, phone, date_of_visit, location_area, main_concern, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     patient_id,
+                    daily_number,
                     data["name"].strip(),
-                    int(data["age"]),
+                    age,
                     data["gender"],
                     data["phone"].strip(),
                     data["date_of_visit"],
@@ -821,51 +879,57 @@ def patients():
         finally:
             cursor.close()
             conn.close()
-        return jsonify({"message": "Patient registered", "id": new_id, "patient_id": patient_id}), 201
+        return jsonify({"message": "Patient registered", "id": new_id, "patient_id": patient_id, "daily_patient_number": daily_number}), 201
 
     search = request.args.get("search", "").strip()
     gender = request.args.get("gender", "").strip()
+    date_from, date_to = request.args.get("date_from", "").strip(), request.args.get("date_to", "").strip()
     sql = "SELECT * FROM patients WHERE 1=1"
     params = []
     if search:
-        sql += " AND (name LIKE %s OR phone LIKE %s OR patient_id LIKE %s)"
+        sql += " AND (name LIKE %s OR phone LIKE %s OR patient_id LIKE %s OR CAST(daily_patient_number AS CHAR) LIKE %s)"
         like = f"%{search}%"
-        params.extend([like, like, like])
+        params.extend([like, like, like, like])
     if gender:
         sql += " AND gender=%s"
         params.append(gender)
-    sql += " ORDER BY created_at DESC"
+    if date_from:
+        sql += " AND date_of_visit >= %s"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date_of_visit <= %s"
+        params.append(date_to)
+    sql += " ORDER BY date_of_visit DESC, daily_patient_number IS NULL, daily_patient_number, created_at DESC LIMIT 1000"
     rows = [row_dates_to_string(row) for row in query_all(sql, tuple(params))]
     return jsonify(rows)
 
 
-@app.route("/api/patients/<int:patient_id>", methods=["PUT", "DELETE"])
-@login_required("receptionist")
+@app.route("/api/patients/<int:patient_id>", methods=["GET", "PUT", "DELETE"])
+@login_required()
 def patient_detail(patient_id):
-    existing = query_one("SELECT id FROM patients WHERE id=%s", (patient_id,))
+    existing = query_one("SELECT * FROM patients WHERE id=%s", (patient_id,))
     if not existing:
         return jsonify({"error": "Patient not found"}), 404
+    if request.method == "GET":
+        history = query_all("SELECT * FROM prescriptions WHERE patient_db_id=%s ORDER BY prescription_date DESC, created_at DESC", (patient_id,))
+        return jsonify({"patient": row_dates_to_string(existing), "prescriptions": [row_dates_to_string(row) for row in history]})
     if request.method == "DELETE":
-        conn = get_db()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("DELETE FROM appointments WHERE patient_db_id=%s", (patient_id,))
-            cursor.execute("DELETE FROM prescriptions WHERE patient_db_id=%s", (patient_id,))
-            cursor.execute("DELETE FROM patients WHERE id=%s", (patient_id,))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cursor.close()
-            conn.close()
-        return jsonify({"message": "Patient permanently deleted"})
+        return jsonify({"error": "Patient records are retained to protect clinical history."}), 409
+    if session["user"]["role"] != "receptionist":
+        return jsonify({"error": "Only Reception can edit patient information"}), 403
 
     data = request.get_json(force=True)
     required = ["name", "age", "gender", "phone", "date_of_visit", "location_area", "main_concern"]
     missing = [field for field in required if not str(data.get(field, "")).strip()]
     if missing:
         return jsonify({"error": "Missing fields", "fields": missing}), 400
+    try:
+        new_visit_date = date.fromisoformat(data["date_of_visit"])
+    except ValueError:
+        return jsonify({"error": "Enter a valid visit date."}), 400
+    old_visit_date = existing["date_of_visit"]
+    if existing.get("daily_patient_number") is not None and str(old_visit_date) != new_visit_date.isoformat():
+        return jsonify({"error": "The date cannot be changed after a daily patient number has been assigned."}), 409
     execute(
         """
         UPDATE patients
@@ -1019,8 +1083,7 @@ def session_detail(session_id):
     if not existing:
         return jsonify({"error": "Session not found"}), 404
     if request.method == "DELETE":
-        execute("DELETE FROM prescriptions WHERE id=%s", (session_id,))
-        return jsonify({"message": "Session permanently deleted", "id": session_id})
+        return jsonify({"error": "Clinical history is retained and cannot be deleted."}), 409
 
     data = request.get_json(force=True)
     execute(
@@ -1050,8 +1113,7 @@ def prescription_detail(prescription_id):
     if not existing:
         return jsonify({"error": "Prescription not found"}), 404
     if request.method == "DELETE":
-        execute("DELETE FROM prescriptions WHERE id=%s", (prescription_id,))
-        return jsonify({"message": "Prescription permanently deleted"})
+        return jsonify({"error": "Clinical history is retained and cannot be deleted."}), 409
 
     data = request.get_json(force=True)
     execute(
@@ -1249,8 +1311,7 @@ def catalog_detail(item_id):
     if not existing:
         return jsonify({"error": "Catalog item not found"}), 404
     if request.method == "DELETE":
-        execute("DELETE FROM product_catalog WHERE id=%s", (item_id,))
-        return jsonify({"message": "Catalog item deleted"})
+        return jsonify({"error": "Catalog records are retained; edit the item to update it."}), 409
 
     data = request.get_json(force=True)
     name = data.get("name", "").strip()
@@ -1291,6 +1352,50 @@ def export_csv(kind):
     else:
         return jsonify({"error": "Unknown export"}), 404
     return app.response_class(csv_text, mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename=clinic-{kind}.csv"})
+
+
+@app.route("/api/export/patients.xlsx")
+@login_required()
+def export_patients_xlsx():
+    date_from, date_to = request.args.get("date_from", "").strip(), request.args.get("date_to", "").strip()
+    filename = "Nadhira_All_Patients.xlsx"
+    where, params = "", []
+    if date_from or date_to:
+        try:
+            start_day = date.fromisoformat(date_from or date_to)
+            end_day = date.fromisoformat(date_to or date_from)
+            if end_day < start_day or (end_day - start_day).days > 3660:
+                raise ValueError("Invalid date range")
+        except ValueError:
+            return jsonify({"error": "Invalid date range"}), 400
+        where = "WHERE date_of_visit BETWEEN %s AND %s"
+        params = [start_day.isoformat(), end_day.isoformat()]
+        if start_day == end_day:
+            filename = f"Nadhira_Patients_{start_day.isoformat()}.xlsx"
+        else:
+            filename = f"Nadhira_Patients_{start_day.isoformat()}_to_{end_day.isoformat()}.xlsx"
+    headers = ["Date", "Daily Patient Number", "Permanent Patient ID", "Patient Name", "Phone", "Age", "Gender", "Created By", "Created Date/Time", "Area", "Concern"]
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet("Patients")
+    sheet.append(headers)
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            f"""SELECT date_of_visit, daily_patient_number, patient_id, name, phone, age, gender,
+                       created_by, created_at, location_area, main_concern
+                FROM patients {where} ORDER BY date_of_visit, daily_patient_number, id""",
+            tuple(params),
+        )
+        fields = ("date_of_visit", "daily_patient_number", "patient_id", "name", "phone", "age", "gender", "created_by", "created_at", "location_area", "main_concern")
+        for row in cursor:
+            sheet.append([row.get(key) for key in fields])
+    finally:
+        cursor.close()
+        conn.close()
+    output = BytesIO()
+    workbook.save(output)
+    return app.response_class(output.getvalue(), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.route("/api/backup")
