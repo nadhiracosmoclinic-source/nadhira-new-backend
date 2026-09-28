@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS patients (
     phone VARCHAR(30) NOT NULL,
     date_of_visit DATE NOT NULL,
     daily_patient_number INT NULL,
+    archived_at DATETIME NULL,
+    archived_by VARCHAR(80) NULL,
     location_area VARCHAR(180) NOT NULL,
     main_concern TEXT NOT NULL,
     created_by VARCHAR(80) NOT NULL,
