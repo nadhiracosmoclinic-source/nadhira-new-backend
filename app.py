@@ -176,6 +176,8 @@ def create_tables():
             phone VARCHAR(30) NOT NULL,
             date_of_visit DATE NOT NULL,
             daily_patient_number INT NULL,
+            archived_at DATETIME NULL,
+            archived_by VARCHAR(80) NULL,
             location_area VARCHAR(180) NOT NULL,
             main_concern TEXT NOT NULL,
             created_by VARCHAR(80) NOT NULL,
@@ -315,6 +317,14 @@ def ensure_production_schema():
     )
     if not cursor.fetchone()[0]:
         cursor.execute("ALTER TABLE patients ADD COLUMN daily_patient_number INT NULL")
+    for column_name, definition in [("archived_at", "DATETIME NULL"), ("archived_by", "VARCHAR(80) NULL")]:
+        cursor.execute(
+            """SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+               WHERE TABLE_SCHEMA=%s AND TABLE_NAME='patients' AND COLUMN_NAME=%s""",
+            (database, column_name),
+        )
+        if not cursor.fetchone()[0]:
+            cursor.execute(f"ALTER TABLE patients ADD COLUMN {column_name} {definition}")
     for statement in [
         "CREATE INDEX idx_patient_created ON patients (created_at)",
         "CREATE UNIQUE INDEX uq_patient_date_daily_number ON patients (date_of_visit, daily_patient_number)",
@@ -705,12 +715,12 @@ def dashboard():
         return jsonify({"error": "Invalid date range"}), 400
     week_start = (end_day - timedelta(days=6)).isoformat()
     month_start = end_day.replace(day=1).isoformat()
-    total_patients = query_one("SELECT COUNT(*) AS count FROM patients")["count"]
-    today_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit=%s", (today,))["count"]
-    selected_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (date_from, date_to))["count"]
+    total_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE archived_at IS NULL")["count"]
+    today_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE archived_at IS NULL AND date_of_visit=%s", (today,))["count"]
+    selected_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE archived_at IS NULL AND date_of_visit BETWEEN %s AND %s", (date_from, date_to))["count"]
     returning_patients = query_one(
-        """SELECT COUNT(*) AS count FROM patients p WHERE p.date_of_visit BETWEEN %s AND %s
-           AND EXISTS (SELECT 1 FROM patients old WHERE old.phone=p.phone AND old.date_of_visit<p.date_of_visit)""",
+        """SELECT COUNT(*) AS count FROM patients p WHERE p.archived_at IS NULL AND p.date_of_visit BETWEEN %s AND %s
+           AND EXISTS (SELECT 1 FROM patients old WHERE old.archived_at IS NULL AND old.phone=p.phone AND old.date_of_visit<p.date_of_visit)""",
         (date_from, date_to),
     )["count"]
     total_prescriptions = query_one("SELECT COUNT(*) AS count FROM prescriptions")["count"]
@@ -722,7 +732,7 @@ def dashboard():
         "SELECT COUNT(*) AS count FROM appointments WHERE appointment_date >= %s AND status='Scheduled'",
         (today,),
     )["count"]
-    new_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (date_from, date_to))["count"] - returning_patients
+    new_patients = query_one("SELECT COUNT(*) AS count FROM patients WHERE archived_at IS NULL AND date_of_visit BETWEEN %s AND %s", (date_from, date_to))["count"] - returning_patients
     follow_ups = query_one("SELECT COUNT(*) AS count FROM prescriptions WHERE follow_up_date >= %s", (today,))["count"]
     sessions_completed = query_one(
         """
@@ -730,7 +740,7 @@ def dashboard():
         WHERE COALESCE(session_recommended, '') <> '' OR COALESCE(session_type, '') <> ''
         """
     )["count"]
-    gender_rows = query_all("SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender")
+    gender_rows = query_all("SELECT gender, COUNT(*) AS count FROM patients WHERE archived_at IS NULL GROUP BY gender")
     patients_by_gender = {"Female": 0, "Male": 0, "Other": 0}
     for row in gender_rows:
         patients_by_gender[row["gender"]] = row["count"]
@@ -771,7 +781,7 @@ def dashboard():
     recent_registrations = query_all(
         """
         SELECT id, patient_id, daily_patient_number, name, phone, date_of_visit, created_at
-        FROM patients
+        FROM patients WHERE archived_at IS NULL
         WHERE date_of_visit BETWEEN %s AND %s
         ORDER BY created_at DESC
         LIMIT 8
@@ -780,7 +790,7 @@ def dashboard():
     )
     selected_patient_rows = query_all(
         """SELECT id, patient_id, daily_patient_number, name, phone, date_of_visit, created_at, created_by
-           FROM patients WHERE date_of_visit BETWEEN %s AND %s
+           FROM patients WHERE archived_at IS NULL AND date_of_visit BETWEEN %s AND %s
            ORDER BY date_of_visit DESC, daily_patient_number IS NULL, daily_patient_number, created_at LIMIT 500""",
         (date_from, date_to),
     )
@@ -804,8 +814,8 @@ def dashboard():
         "selectedDateFrom": date_from,
         "selectedDateTo": date_to,
         "returningPatients": returning_patients,
-        "thisWeekPatients": query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (week_start, date_to))["count"],
-        "thisMonthPatients": query_one("SELECT COUNT(*) AS count FROM patients WHERE date_of_visit BETWEEN %s AND %s", (month_start, date_to))["count"],
+        "thisWeekPatients": query_one("SELECT COUNT(*) AS count FROM patients WHERE archived_at IS NULL AND date_of_visit BETWEEN %s AND %s", (week_start, date_to))["count"],
+        "thisMonthPatients": query_one("SELECT COUNT(*) AS count FROM patients WHERE archived_at IS NULL AND date_of_visit BETWEEN %s AND %s", (month_start, date_to))["count"],
         "totalVisits": total_patients,
         "dailyPatients": [row_dates_to_string(row) for row in selected_patient_rows],
         "malePatients": patients_by_gender["Male"],
@@ -884,7 +894,7 @@ def patients():
     search = request.args.get("search", "").strip()
     gender = request.args.get("gender", "").strip()
     date_from, date_to = request.args.get("date_from", "").strip(), request.args.get("date_to", "").strip()
-    sql = "SELECT * FROM patients WHERE 1=1"
+    sql = "SELECT * FROM patients WHERE archived_at IS NULL"
     params = []
     if search:
         sql += " AND (name LIKE %s OR phone LIKE %s OR patient_id LIKE %s OR CAST(daily_patient_number AS CHAR) LIKE %s)"
@@ -914,7 +924,31 @@ def patient_detail(patient_id):
         history = query_all("SELECT * FROM prescriptions WHERE patient_db_id=%s ORDER BY prescription_date DESC, created_at DESC", (patient_id,))
         return jsonify({"patient": row_dates_to_string(existing), "prescriptions": [row_dates_to_string(row) for row in history]})
     if request.method == "DELETE":
-        return jsonify({"error": "Patient records are retained to protect clinical history."}), 409
+        if session["user"]["role"] != "receptionist":
+            return jsonify({"error": "Only Reception can archive a patient registration."}), 403
+        if existing.get("archived_at") is not None:
+            return jsonify({"error": "This patient registration is already archived."}), 409
+        conn = get_db()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE patients SET archived_at=CURRENT_TIMESTAMP, archived_by=%s WHERE id=%s AND archived_at IS NULL",
+                (session["user"]["username"], patient_id),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return jsonify({"error": "This patient registration was already archived."}), 409
+            record_activity("patient", "Patient registration archived", f"{existing['name']} ({existing['patient_id']})", "patient", patient_id, session["user"]["username"], "doctor", "patients", conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+        return jsonify({"message": "Patient registration archived. Its history is retained."})
+    if existing.get("archived_at") is not None:
+        return jsonify({"error": "Archived patient registrations cannot be edited."}), 409
     if session["user"]["role"] != "receptionist":
         return jsonify({"error": "Only Reception can edit patient information"}), 403
 
@@ -1183,7 +1217,7 @@ def mark_notification_read(notification_id):
 def daily_archive():
     archive_date = request.args.get("date", date.today().isoformat())
     patients = query_all(
-        "SELECT id, patient_id, name, phone, date_of_visit, main_concern, created_at FROM patients WHERE date_of_visit=%s ORDER BY created_at DESC",
+        "SELECT id, patient_id, name, phone, date_of_visit, main_concern, created_at FROM patients WHERE archived_at IS NULL AND date_of_visit=%s ORDER BY created_at DESC",
         (archive_date,),
     )
     prescriptions = query_all(
@@ -1225,9 +1259,9 @@ def daily_archive():
 @app.route("/api/reports")
 @login_required()
 def reports():
-    gender_rows = query_all("SELECT gender, COUNT(*) AS count FROM patients GROUP BY gender")
+    gender_rows = query_all("SELECT gender, COUNT(*) AS count FROM patients WHERE archived_at IS NULL GROUP BY gender")
     concern_rows = query_all(
-        "SELECT main_concern, COUNT(*) AS count FROM patients GROUP BY main_concern ORDER BY count DESC LIMIT 8"
+        "SELECT main_concern, COUNT(*) AS count FROM patients WHERE archived_at IS NULL GROUP BY main_concern ORDER BY count DESC LIMIT 8"
     )
     return jsonify({"byGender": gender_rows, "topConcerns": concern_rows})
 
@@ -1341,7 +1375,7 @@ def catalog_detail(item_id):
 @login_required()
 def export_csv(kind):
     if kind == "patients":
-        rows = [row_dates_to_string(row) for row in query_all("SELECT * FROM patients ORDER BY created_at DESC")]
+        rows = [row_dates_to_string(row) for row in query_all("SELECT * FROM patients WHERE archived_at IS NULL ORDER BY created_at DESC")]
         csv_text = rows_to_csv(rows, ["patient_id", "name", "age", "gender", "phone", "date_of_visit", "location_area", "main_concern", "created_at"])
     elif kind == "prescriptions":
         rows = [row_dates_to_string(row) for row in query_all("SELECT * FROM prescriptions ORDER BY created_at DESC")]
@@ -1368,7 +1402,7 @@ def export_patients_xlsx():
                 raise ValueError("Invalid date range")
         except ValueError:
             return jsonify({"error": "Invalid date range"}), 400
-        where = "WHERE date_of_visit BETWEEN %s AND %s"
+        where = "AND date_of_visit BETWEEN %s AND %s"
         params = [start_day.isoformat(), end_day.isoformat()]
         if start_day == end_day:
             filename = f"Nadhira_Patients_{start_day.isoformat()}.xlsx"
@@ -1384,7 +1418,7 @@ def export_patients_xlsx():
         cursor.execute(
             f"""SELECT date_of_visit, daily_patient_number, patient_id, name, phone, age, gender,
                        created_by, created_at, location_area, main_concern
-                FROM patients {where} ORDER BY date_of_visit, daily_patient_number, id""",
+                FROM patients WHERE archived_at IS NULL {where} ORDER BY date_of_visit, daily_patient_number, id""",
             tuple(params),
         )
         fields = ("date_of_visit", "daily_patient_number", "patient_id", "name", "phone", "age", "gender", "created_by", "created_at", "location_area", "main_concern")
