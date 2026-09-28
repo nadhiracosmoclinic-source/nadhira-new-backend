@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS patients (
     gender ENUM('Female', 'Male', 'Other') NOT NULL,
     phone VARCHAR(30) NOT NULL,
     date_of_visit DATE NOT NULL,
+    daily_patient_number INT NULL,
     location_area VARCHAR(180) NOT NULL,
     main_concern TEXT NOT NULL,
     created_by VARCHAR(80) NOT NULL,
@@ -25,7 +26,14 @@ CREATE TABLE IF NOT EXISTS patients (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_patient_search (name, phone, patient_id),
     INDEX idx_patient_gender (gender),
-    INDEX idx_visit_date (date_of_visit)
+    INDEX idx_visit_date (date_of_visit),
+    UNIQUE KEY uq_patient_date_daily_number (date_of_visit, daily_patient_number)
+);
+
+CREATE TABLE IF NOT EXISTS daily_patient_sequences (
+    sequence_date DATE PRIMARY KEY,
+    next_number INT NOT NULL DEFAULT 1,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS patient_id_sequences (
