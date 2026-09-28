@@ -1,23 +1,7 @@
-USE clinic;
-
 DELIMITER //
 
 CREATE PROCEDURE apply_nadhira_production_migration()
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'patients' AND COLUMN_NAME = 'deleted_at'
-    ) THEN
-        ALTER TABLE patients DROP COLUMN deleted_at;
-    END IF;
-
-    IF EXISTS (
-        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'prescriptions' AND COLUMN_NAME = 'deleted_at'
-    ) THEN
-        ALTER TABLE prescriptions DROP COLUMN deleted_at;
-    END IF;
-
     CREATE TABLE IF NOT EXISTS patient_id_sequences (
         sequence_date DATE PRIMARY KEY,
         next_number INT NOT NULL DEFAULT 1,
@@ -29,6 +13,26 @@ BEGIN
         next_number INT NOT NULL DEFAULT 1,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS daily_patient_sequences (
+        sequence_date DATE PRIMARY KEY,
+        next_number INT NOT NULL DEFAULT 1,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    );
+
+    IF NOT EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'patients' AND COLUMN_NAME = 'daily_patient_number'
+    ) THEN
+        ALTER TABLE patients ADD COLUMN daily_patient_number INT NULL;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'patients' AND INDEX_NAME = 'uq_patient_date_daily_number'
+    ) THEN
+        CREATE UNIQUE INDEX uq_patient_date_daily_number ON patients (date_of_visit, daily_patient_number);
+    END IF;
 
     IF NOT EXISTS (
         SELECT 1 FROM INFORMATION_SCHEMA.STATISTICS
